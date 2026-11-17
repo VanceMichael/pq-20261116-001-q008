@@ -5,6 +5,7 @@ import { ArticleRepository } from "../store/article-repository.js";
 import { FetchRepository } from "../store/fetch-repository.js";
 import { ImportService } from "../ingest/import-service.js";
 import { PageFetcher } from "../acquisition/page-fetcher.js";
+import { SiteRequestLimiter } from "../acquisition/site-budget.js";
 import { RefreshService } from "./refresh-service.js";
 import { ChangeReportService } from "./change-report.js";
 import { HealthReportService } from "./health-report.js";
@@ -30,10 +31,14 @@ export class NewsArchive {
       articles: this.articles,
       clock: this.clock
     });
+    const budgetOptions = { now: () => this.clock().getTime() };
+    if (options.perSiteBudget !== undefined) budgetOptions.perSiteBudget = options.perSiteBudget;
+    if (options.maxQueuedPerSite !== undefined) budgetOptions.maxQueuedPerSite = options.maxQueuedPerSite;
+    this.siteBudget = options.siteBudget ?? new SiteRequestLimiter(budgetOptions);
     this.refreshes = new RefreshService({
       feeds: this.feeds,
       fetches: this.fetches,
-      fetcher: options.fetcher ?? new PageFetcher(),
+      fetcher: options.fetcher ?? new PageFetcher({ limiter: this.siteBudget, now: () => this.clock().getTime() }),
       imports: this.imports,
       clock: this.clock
     });
@@ -53,8 +58,15 @@ export class NewsArchive {
     return this.imports.importHtml(feedId, html, capturedAt);
   }
 
-  refreshFeed(feedId) {
-    return this.refreshes.refresh(feedId);
+  refreshFeed(feedId, options) {
+    return this.refreshes.refresh(feedId, options);
+  }
+
+  refreshQueue() {
+    return {
+      jobs: this.refreshes.queueSnapshot(),
+      sites: this.siteBudget.snapshot()
+    };
   }
 
   feedStatus(feedId) {

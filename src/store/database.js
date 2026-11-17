@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { dirname, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 export function openDatabase(filename) {
   const path = resolve(filename);
@@ -17,6 +17,7 @@ export function migrate(database) {
   const version = database.prepare("PRAGMA user_version").get().user_version;
   if (version > SCHEMA_VERSION) throw new Error(`database schema ${version} is newer than supported ${SCHEMA_VERSION}`);
   if (version === SCHEMA_VERSION) return;
+  if (version === 1) return migrateFromV1(database);
   database.exec(`
     BEGIN IMMEDIATE;
     CREATE TABLE IF NOT EXISTS feeds (
@@ -72,7 +73,7 @@ export function migrate(database) {
       feed_id TEXT NOT NULL REFERENCES feeds(feed_id),
       started_at TEXT NOT NULL,
       finished_at TEXT NOT NULL,
-      outcome TEXT NOT NULL CHECK(outcome IN ('accepted', 'rejected', 'not_modified', 'failed')),
+      outcome TEXT NOT NULL CHECK(outcome IN ('accepted', 'rejected', 'not_modified', 'failed', 'cancelled')),
       http_status INTEGER,
       attempt_count INTEGER NOT NULL,
       requested_url TEXT NOT NULL,
@@ -92,7 +93,37 @@ export function migrate(database) {
       changed_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS review_events_article_time ON review_events(article_id, event_id DESC);
-    PRAGMA user_version = 1;
+    PRAGMA user_version = 2;
+    COMMIT;
+  `);
+}
+
+function migrateFromV1(database) {
+  database.exec("BEGIN IMMEDIATE;");
+  // SQLite cannot alter a CHECK constraint in place; rebuild the audit table so
+  // cancelled queue/request attempts can be recorded without touching history.
+  database.exec(`
+    CREATE TABLE fetch_attempts_v2 (
+      attempt_id INTEGER PRIMARY KEY,
+      feed_id TEXT NOT NULL REFERENCES feeds(feed_id),
+      started_at TEXT NOT NULL,
+      finished_at TEXT NOT NULL,
+      outcome TEXT NOT NULL CHECK(outcome IN ('accepted', 'rejected', 'not_modified', 'failed', 'cancelled')),
+      http_status INTEGER,
+      attempt_count INTEGER NOT NULL,
+      requested_url TEXT NOT NULL,
+      final_url TEXT,
+      capture_id INTEGER REFERENCES captures(capture_id),
+      error_code TEXT,
+      error_message TEXT
+    );
+    INSERT INTO fetch_attempts_v2
+      SELECT attempt_id, feed_id, started_at, finished_at, outcome, http_status, attempt_count,
+        requested_url, final_url, capture_id, error_code, error_message FROM fetch_attempts;
+    DROP TABLE fetch_attempts;
+    ALTER TABLE fetch_attempts_v2 RENAME TO fetch_attempts;
+    CREATE INDEX IF NOT EXISTS fetch_attempts_feed_time ON fetch_attempts(feed_id, attempt_id DESC);
+    PRAGMA user_version = 2;
     COMMIT;
   `);
 }

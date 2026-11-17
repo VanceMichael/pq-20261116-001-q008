@@ -46,6 +46,9 @@ async function routeRequest(request, response, archive) {
     const feed = archive.registerFeed(input);
     return writeJson(response, 201, { feed });
   }
+  if (segments.length === 2 && segments[0] === "v1" && segments[1] === "refresh-queue" && request.method === "GET") {
+    return writeJson(response, 200, archive.refreshQueue());
+  }
   if (segments[0] !== "v1" || segments[1] !== "feeds" || !segments[2]) return notFound(response);
   const feedId = segments[2];
   validateFeedId(feedId);
@@ -55,9 +58,14 @@ async function routeRequest(request, response, archive) {
     return writeJson(response, result.accepted ? result.replay ? 200 : 202 : 422, result);
   }
   if (segments.length === 4 && segments[3] === "refresh" && request.method === "POST") {
-    const result = await archive.refreshFeed(feedId);
-    const status = result.outcome === "accepted" ? result.capture.replay ? 200 : 202 : result.outcome === "not_modified" ? 200 : 422;
-    return writeJson(response, status, result);
+    try {
+      const result = await archive.refreshFeed(feedId);
+      const status = result.outcome === "accepted" ? result.capture.replay ? 200 : 202 : result.outcome === "not_modified" ? 200 : 422;
+      return writeJson(response, status, result);
+    } catch (error) {
+      if (error.statusCode === 499) return writeJson(response, 499, { error: "cancelled", message: error.message });
+      throw error;
+    }
   }
   if (segments.length === 3 && request.method === "GET") {
     const result = archive.feedStatus(feedId);

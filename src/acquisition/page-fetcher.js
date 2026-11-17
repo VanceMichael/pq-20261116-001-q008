@@ -12,9 +12,11 @@ export class PageFetcher {
     maxAttempts = 3,
     backoffBaseMs = 200,
     sleep = delay,
-    now = () => Date.now()
+    now = () => Date.now(),
+    limiter = null
   } = {}) {
     if (typeof fetchImpl !== "function") throw new TypeError("a Fetch-compatible implementation is required");
+    if (limiter !== null && typeof limiter.run !== "function") throw new TypeError("limiter must expose a run() method");
     this.fetchImpl = fetchImpl;
     this.timeoutMs = boundedInteger(timeoutMs, 100, 120_000, "timeoutMs");
     this.maxBytes = boundedInteger(maxBytes, 1024, 5 * 1024 * 1024, "maxBytes");
@@ -23,18 +25,20 @@ export class PageFetcher {
     this.backoffBaseMs = boundedInteger(backoffBaseMs, 0, 10_000, "backoffBaseMs");
     this.sleep = sleep;
     this.now = now;
+    this.limiter = limiter;
   }
 
-  async fetchFeed(feed) {
+  async fetchFeed(feed, { signal, onPhase } = {}) {
     const initial = new URL(feed.baseUrl);
     const allowedHosts = feed.allowedHosts ?? [];
     assertAllowed(initial, allowedHosts);
+    throwIfAborted(signal);
     const startedAt = new Date(this.now()).toISOString();
-    const result = await this.requestWithRedirects(initial, allowedHosts);
+    const result = await this.requestWithRedirects(initial, allowedHosts, signal, onPhase, feed.feedId);
     return { ...result, requestedUrl: initial.href, startedAt };
   }
 
-  async requestWithRedirects(initialUrl, allowedHosts) {
+  async requestWithRedirects(initialUrl, allowedHosts, signal, onPhase, feedId) {
     let currentUrl = initialUrl;
     const visited = new Set();
     let attemptCount = 0;
@@ -43,7 +47,9 @@ export class PageFetcher {
       assertAllowed(currentUrl, allowedHosts);
       if (visited.has(currentUrl.href)) throw fetchError("redirect_loop", "source returned a redirect loop");
       visited.add(currentUrl.href);
-      const response = await this.requestWithRetry(currentUrl);
+      // Each hop acquires the budget of the host that actually answers it,
+      // so a legal redirect can no longer borrow the origin site's quota.
+      const response = await this.dispatch(currentUrl, allowedHosts, signal, onPhase, feedId);
       attemptCount += response.attemptCount;
       lastStatus = response.status;
       if (response.status === 304) {
@@ -71,15 +77,34 @@ export class PageFetcher {
     throw fetchError("redirect_limit", "source exceeded redirect limit", lastStatus);
   }
 
-  async requestWithRetry(url) {
+  dispatch(url, allowedHosts, signal, onPhase, feedId) {
+    if (!this.limiter) return this.requestWithRetry(url, signal, onPhase);
+    return this.limiter.run(url.hostname, {
+      feedId,
+      signal,
+      task: async (lease) => {
+        try {
+          return await this.requestWithRetry(url, signal, onPhase);
+        } finally {
+          // The slot belongs to this hop only; redirects acquire the target
+          // host budget themselves and retries re-enter the queue.
+          lease.release();
+        }
+      }
+    });
+  }
+
+  async requestWithRetry(url, signal, onPhase) {
     let lastError;
     for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
       try {
+        throwIfAborted(signal);
+        onPhase?.("request", { url: url.href, attempt });
         const response = await this.fetchImpl(url.href, {
           method: "GET",
           redirect: "manual",
           headers: { accept: "text/html,application/xhtml+xml;q=0.9", "user-agent": "RollingNewsArchive/1.0" },
-          signal: AbortSignal.timeout(this.timeoutMs)
+          signal: combineSignals(signal, AbortSignal.timeout(this.timeoutMs))
         });
         if (!RETRYABLE_STATUS.has(response.status) || attempt === this.maxAttempts) {
           return { status: response.status, headers: response.headers, ok: response.ok,
@@ -87,18 +112,49 @@ export class PageFetcher {
         }
         const retryAfter = parseRetryAfter(response.headers.get("retry-after"), this.now());
         await response.body?.cancel();
-        await this.sleep(retryAfter ?? this.backoffBaseMs * 2 ** (attempt - 1));
+        await this.abortableSleep(retryAfter ?? this.backoffBaseMs * 2 ** (attempt - 1), signal);
       } catch (error) {
+        // External cancellation is never retried or misreported as a network fault.
+        if (isAbortError(error) && signal?.aborted) {
+          throw Object.assign(fetchError("fetch_aborted", "refresh was cancelled while the request was in flight"), {
+            attemptCount: attempt
+          });
+        }
         lastError = error;
         if (error.code && error.code !== "fetch_failed") throw error;
         if (attempt === this.maxAttempts) break;
-        await this.sleep(this.backoffBaseMs * 2 ** (attempt - 1));
+        await this.abortableSleep(this.backoffBaseMs * 2 ** (attempt - 1), signal);
       }
     }
     throw Object.assign(fetchError("fetch_failed", lastError?.message ?? "source request failed"), {
       attemptCount: this.maxAttempts
     });
   }
+
+  async abortableSleep(duration, signal) {
+    if (signal?.aborted) {
+      throw Object.assign(fetchError("fetch_aborted", "refresh was cancelled while backing off"), { attemptCount: 0 });
+    }
+    await this.sleep(duration, signal);
+    if (signal?.aborted) {
+      throw Object.assign(fetchError("fetch_aborted", "refresh was cancelled while backing off"), { attemptCount: 0 });
+    }
+  }
+}
+
+function combineSignals(external, timeout) {
+  if (!external) return timeout;
+  return AbortSignal.any([external, timeout]);
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw Object.assign(new Error("refresh was cancelled before the request started"), { code: "refresh_cancelled" });
+  }
+}
+
+function isAbortError(error) {
+  return error?.name === "AbortError" || error?.code === "ABORT_ERR";
 }
 
 export async function readBoundedText(response, maxBytes) {
